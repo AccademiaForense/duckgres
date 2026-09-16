@@ -1,0 +1,150 @@
+diff --git a/src/functions/ducklake_flush_inlined_data.cpp b/src/functions/ducklake_flush_inlined_data.cpp
+index 87f54a5..2ed6e13 100644
+--- a/src/functions/ducklake_flush_inlined_data.cpp
++++ b/src/functions/ducklake_flush_inlined_data.cpp
+@@ -756,7 +756,7 @@ static unique_ptr<LogicalOperator> FlushInlinedDataBind(ClientContext &context,
+ 	auto projection = make_uniq<LogicalProjection>(bind_index, std::move(proj_exprs));
+ 	projection->children.push_back(std::move(filter));
+ 
+-	return projection;
++	return unique_ptr<LogicalOperator>(std::move(projection));
+ }
+ 
+ DuckLakeFlushInlinedDataFunction::DuckLakeFlushInlinedDataFunction()
+diff --git a/src/metadata_manager/quack_metadata_manager.cpp b/src/metadata_manager/quack_metadata_manager.cpp
+index 665d0a9..9be05e4 100644
+--- a/src/metadata_manager/quack_metadata_manager.cpp
++++ b/src/metadata_manager/quack_metadata_manager.cpp
+@@ -46,7 +46,7 @@ unique_ptr<QueryResult> QuackMetadataManager::AttachMetadata(const string &attac
+ 		}
+ 		result = fresh_conn.Query(query);
+ 	}
+-	return result;
++	return unique_ptr<QueryResult>(std::move(result));
+ }
+ 
+ unique_ptr<QueryResult> QuackMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
+diff --git a/src/storage/ducklake_inlined_data_reader.cpp b/src/storage/ducklake_inlined_data_reader.cpp
+index 63f00af..77747be 100644
+--- a/src/storage/ducklake_inlined_data_reader.cpp
++++ b/src/storage/ducklake_inlined_data_reader.cpp
+@@ -178,7 +178,11 @@ bool DuckLakeInlinedDataReader::TryInitializeScan(ClientContext &context, Global
+ 		data->data->InitializeScan(state, scan_column_ids);
+ 	}
+ 	for (auto &entry : expression_map) {
+-		expression_executors[entry.first] = make_uniq<ExpressionExecutor>(context, *entry.second);
++		// The PostHog 1.5.5 core already keys expressions by the primary file
++		// column, not by its position in column_indexes.
++		auto column_id = entry.first.GetIndex();
++		auto &expression = *entry.second.expression;
++		expression_executors[column_id] = make_uniq<ExpressionExecutor>(context, expression);
+ 	}
+ 	return true;
+ }
+diff --git a/src/storage/ducklake_transaction.cpp b/src/storage/ducklake_transaction.cpp
+index ca198c7..15f6395 100644
+--- a/src/storage/ducklake_transaction.cpp
++++ b/src/storage/ducklake_transaction.cpp
+@@ -1501,7 +1501,7 @@ unique_ptr<QueryResult> DuckLakeTransaction::ExecuteRaw(string query) {
+ 	if (cb) {
+ 		cb(query, end - start);
+ 	}
+-	return result;
++	return unique_ptr<QueryResult>(std::move(result));
+ }
+ 
+ unique_ptr<QueryResult> DuckLakeTransaction::Query(string query) {
+diff --git a/test/sql/data_inlining/data_inlining_expression_projection.test b/test/sql/data_inlining/data_inlining_expression_projection.test
+new file mode 100644
+index 0000000..e180f4c
+--- /dev/null
++++ b/test/sql/data_inlining/data_inlining_expression_projection.test
+@@ -0,0 +1,88 @@
++# name: test/sql/data_inlining/data_inlining_expression_projection.test
++# description: Inlined filter expressions use physical column ids with sparse and reordered projections
++# group: [data_inlining]
++
++require ducklake
++
++require parquet
++
++require icu
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++SET TimeZone = 'UTC'
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/inlining_expression_projection', DATA_INLINING_ROW_LIMIT 100)
++
++statement ok
++CREATE TABLE ducklake.records(id INTEGER, pad1 VARCHAR, pad2 INTEGER, pad3 VARCHAR, event_at TIMESTAMP)
++
++statement ok
++INSERT INTO ducklake.records VALUES (1, 'a', 10, 'x', TIMESTAMP '2000-01-01'), (2, 'b', 20, 'y', TIMESTAMP '2001-01-01'), (3, 'c', 30, 'z', NULL), (4, 'd', 40, 'w', TIMESTAMP '2002-01-01')
++
++query I
++SELECT count(*) FROM ducklake.records WHERE filename = 'ducklake_inlined_data_1_1'
++----
++4
++
++statement ok
++ALTER TABLE ducklake.records ALTER event_at SET DATA TYPE TIMESTAMPTZ
++
++# This widening cast cannot push the TIMESTAMPTZ filter into the old TIMESTAMP
++# column directly. The reader must evaluate the cast expression before filtering.
++# Only physical column 4 is projected: indexing column_indexes by that physical
++# id instead of the scan position would read outside the projection list.
++query T
++SELECT event_at::DATE FROM ducklake.records WHERE event_at >= TIMESTAMPTZ '2001-01-01 00:00:00+00' ORDER BY event_at
++----
++2001-01-01
++2002-01-01
++
++query TI
++SELECT event_at::DATE, id FROM ducklake.records WHERE event_at >= TIMESTAMPTZ '2001-01-01 00:00:00+00' ORDER BY id
++----
++2001-01-01	2
++2002-01-01	4
++
++# Also cover a filter column that is not part of the result projection.
++query I
++SELECT id FROM ducklake.records WHERE event_at >= TIMESTAMPTZ '2001-01-01 00:00:00+00' ORDER BY id
++----
++2
++4
++
++statement ok
++CALL ducklake_flush_inlined_data('ducklake')
++
++query TI
++SELECT event_at::DATE, id FROM ducklake.records WHERE event_at >= TIMESTAMPTZ '2001-01-01 00:00:00+00' ORDER BY id
++----
++2001-01-01	2
++2002-01-01	4
++
++# The transaction-local reader uses a different scan setup but the same
++# expression executor map; it must preserve the same sparse projection mapping.
++statement ok
++CREATE TABLE ducklake.local_records(id INTEGER, pad1 VARCHAR, pad2 INTEGER, pad3 VARCHAR, event_at TIMESTAMP)
++
++statement ok
++BEGIN
++
++statement ok
++INSERT INTO ducklake.local_records VALUES (1, 'a', 10, 'x', TIMESTAMP '2000-01-01'), (2, 'b', 20, 'y', TIMESTAMP '2001-01-01'), (3, 'c', 30, 'z', NULL), (4, 'd', 40, 'w', TIMESTAMP '2002-01-01')
++
++statement ok
++ALTER TABLE ducklake.local_records ALTER event_at SET DATA TYPE TIMESTAMPTZ
++
++query TI
++SELECT event_at::DATE, id FROM ducklake.local_records WHERE event_at >= TIMESTAMPTZ '2001-01-01 00:00:00+00' ORDER BY id
++----
++2001-01-01	2
++2002-01-01	4
++
++statement ok
++ROLLBACK

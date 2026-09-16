@@ -1,0 +1,28 @@
+# Public disposable fixture credentials, never deployment configuration.
+host: "0.0.0.0"
+port: 5432
+data_dir: "/app/data"
+tls:
+  cert: "/app/certs/server.crt"
+  key: "/app/certs/server.key"
+users:
+  ducklake: "bundle-fixture-password"
+extensions: [ducklake, httpfs]
+process_isolation: false
+threads: 2
+memory_limit: "512MB"
+query_log:
+  enabled: false
+ducklake:
+  delta_catalog_enabled: false
+  metadata_store: "postgres:host=bundle-pg port=5432 user=ducklake password=bundle-fixture-password dbname=ducklake sslmode=disable"
+  object_store: "s3://bundle-fixture/ducklake/"
+  s3_provider: "config"
+  s3_endpoint: "bundle-s3:9000"
+  s3_access_key: "bundlefixture"
+  s3_secret_key: "bundle-fixture-secret"
+  s3_region: "us-east-1"
+  s3_use_ssl: false
+  s3_url_style: "path"
+  data_inlining_row_limit: 100
+  checkpoint_interval: "24h"

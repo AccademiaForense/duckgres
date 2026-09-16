@@ -5,3 +5,16 @@ certs/
 *.duckdb
 .idea/
 .vscode/
+
+# Keep local evidence, credentials in fixture configs, caches and binaries out
+# of build contexts and exported CI cache layers.
+artifacts/
+tmp/
+.branch-artifacts/
+**/node_modules/
+/duckgres
+*.test
+.codex/
+.claude/
+.gemini/
+.worktrees/

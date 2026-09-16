@@ -1,0 +1,137 @@
+diff --git a/src/storage/ducklake_scan.cpp b/src/storage/ducklake_scan.cpp
+index 8dddf7f..870a108 100644
+--- a/src/storage/ducklake_scan.cpp
++++ b/src/storage/ducklake_scan.cpp
+@@ -107,6 +107,16 @@ unique_ptr<BaseStatistics> DuckLakeStatistics(ClientContext &context, const Func
+ 	return table.GetStatistics(context, column_index);
+ }
+ 
++unique_ptr<BaseStatistics> DuckLakeStatisticsExtended(ClientContext &context, TableFunctionGetStatisticsInput &input) {
++	auto &column_index = input.column_index;
++	auto result = DuckLakeStatistics(context, input.bind_data.get(), column_index.GetPrimaryIndex());
++	if (!result || !column_index.IsPushdownExtract()) {
++		return result;
++	}
++	auto storage_index = StorageIndex::FromColumnIndex(column_index);
++	return result->PushdownExtract(storage_index.GetChildIndexes()[0]);
++}
++
+ BindInfo DuckLakeBindInfo(const optional_ptr<FunctionData> bind_data) {
+ 	auto &multi_file_data = bind_data->Cast<MultiFileBindData>();
+ 	auto &file_list = multi_file_data.file_list->Cast<DuckLakeMultiFileList>();
+@@ -230,6 +240,9 @@ TableFunction DuckLakeFunctions::GetDuckLakeScanFunction(DatabaseInstance &insta
+ 	}
+ 
+ 	function.statistics = DuckLakeStatistics;
++	// The optimizer prefers this callback over statistics. Do not inherit the
++	// Parquet callback: inline and multi-file scans need the DuckLake catalog.
++	function.statistics_extended = DuckLakeStatisticsExtended;
+ 	function.get_bind_info = DuckLakeBindInfo;
+ 	function.get_virtual_columns = DuckLakeVirtualColumns;
+ 	function.get_row_id_columns = DuckLakeGetRowIdColumn;
+diff --git a/test/sql/stats/extended_catalog_stats.test b/test/sql/stats/extended_catalog_stats.test
+new file mode 100644
+index 0000000..64c0681
+--- /dev/null
++++ b/test/sql/stats/extended_catalog_stats.test
+@@ -0,0 +1,100 @@
++# name: test/sql/stats/extended_catalog_stats.test
++# description: Extended scan statistics use DuckLake catalog stats for inline and multi-file data
++# group: [stats]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/extended_catalog_stats.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/extended_catalog_stats', DATA_INLINING_ROW_LIMIT 100)
++
++statement ok
++CREATE TABLE ducklake.records(id INTEGER, padding VARCHAR, value INTEGER)
++
++statement ok
++INSERT INTO ducklake.records VALUES (1, 'first', 1), (2, 'null', NULL), (3, 'last', 10)
++
++# The inherited Parquet statistics callback cannot describe an inline reader.
++query T
++SELECT stats(value) FROM ducklake.records LIMIT 1
++----
++[Min: 1, Max: 10][Has Null: true, Has No Null: true]
++
++statement ok
++UPDATE ducklake.records SET value = 101 WHERE id = 1
++
++# Global bounds may include deleted values; MIN/MAX must still scan live rows.
++query T
++SELECT stats(value) FROM ducklake.records LIMIT 1
++----
++[Min: 1, Max: 101][Has Null: true, Has No Null: true]
++
++query III
++SELECT min(value), max(value), count(*) FROM ducklake.records
++----
++10	101	3
++
++# Committed catalog bounds must not prune transaction-local inserts.
++statement ok
++BEGIN
++
++statement ok
++INSERT INTO ducklake.records VALUES (4, 'uncommitted', 1000)
++
++query I
++SELECT value FROM ducklake.records WHERE value = 1000
++----
++1000
++
++statement ok
++ROLLBACK
++
++statement ok
++CALL ducklake_flush_inlined_data('ducklake')
++
++statement ok
++CALL ducklake_set_option('ducklake', 'data_inlining_row_limit', 0, schema => 'main', table_name => 'records')
++
++statement ok
++INSERT INTO ducklake.records VALUES (4, 'new file', -7)
++
++# Multiple Parquet files still require the table-wide catalog statistics.
++query T
++SELECT stats(value) FROM ducklake.records LIMIT 1
++----
++[Min: -7, Max: 101][Has Null: true, Has No Null: true]
++
++query III
++SELECT min(value), max(value), count(*) FROM ducklake.records
++----
++-7	101	4
++
++# Nested projections must receive child statistics, not the parent STRUCT type.
++statement ok
++CREATE TABLE ducklake.nested(id INTEGER, payload STRUCT(n INTEGER))
++
++statement ok
++INSERT INTO ducklake.nested VALUES (1, {'n': 20}), (2, {'n': 40}), (3, NULL)
++
++query T
++SELECT stats(payload.n) FROM ducklake.nested LIMIT 1
++----
++[Min: 20, Max: 40][Has Null: true, Has No Null: true]
++
++query II
++SELECT payload.n, id FROM ducklake.nested WHERE payload.n > 20 ORDER BY id
++----
++40	2
++
++statement ok
++CALL ducklake_flush_inlined_data('ducklake')
++
++query II
++SELECT payload.n, id FROM ducklake.nested WHERE payload.n > 20 ORDER BY id
++----
++40	2

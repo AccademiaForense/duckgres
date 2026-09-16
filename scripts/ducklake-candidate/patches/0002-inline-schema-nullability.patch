@@ -1,0 +1,378 @@
+diff --git a/src/storage/ducklake_transaction_state.cpp b/src/storage/ducklake_transaction_state.cpp
+index 87e881c..5f864f8 100644
+--- a/src/storage/ducklake_transaction_state.cpp
++++ b/src/storage/ducklake_transaction_state.cpp
+@@ -1179,8 +1179,9 @@ void DuckLakeTransactionState::GetNewTableInfo(DuckLakeCommitState &commit_state
+ 
+ 			transaction_changes.altered_tables.insert(table_id);
+ 			transaction_changes.altered_tables_with_schema_version_changes.insert(table_id);
++			// Inlined rows must use the new column definition when they are flushed.
++			column_schema_change = true;
+ 			if (local_change.type == LocalChangeType::RENAME_COLUMN) {
+-				column_schema_change = true;
+ 				// persist updated sort expressions (column name was updated in the table entry)
+ 				if (table.GetSortData()) {
+ 					auto sort_key = DuckLakeTransaction::GetNewSortKey(commit_state, table);
+diff --git a/test/sql/data_inlining/data_inlining_nullability_drop.test b/test/sql/data_inlining/data_inlining_nullability_drop.test
+new file mode 100644
+index 0000000..bc7de16
+--- /dev/null
++++ b/test/sql/data_inlining/data_inlining_nullability_drop.test
+@@ -0,0 +1,102 @@
++# name: test/sql/data_inlining/data_inlining_nullability_drop.test
++# description: DROP NOT NULL rotates the inline schema before accepting NULL rows
++# group: [data_inlining]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/inlining_nullability_drop.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/inlining_nullability_drop', METADATA_CATALOG 'ducklake_meta', DATA_INLINING_ROW_LIMIT 100)
++
++statement ok
++CREATE TABLE ducklake.records(id INTEGER, effective_on DATE NOT NULL, payload VARCHAR)
++
++statement ok
++INSERT INTO ducklake.records VALUES (1, DATE '2000-01-01', 'original one'), (2, DATE '2001-02-03', 'original two')
++
++query II
++SELECT table_id, schema_version FROM ducklake_meta.ducklake_inlined_data_tables ORDER BY ALL
++----
++1	1
++
++statement error
++INSERT INTO ducklake.records VALUES (3, NULL, 'must fail')
++----
++NOT NULL constraint
++
++statement ok
++ALTER TABLE ducklake.records ALTER effective_on DROP NOT NULL
++
++# The column metadata and the inline registry must agree. The old inline
++# table still contains the original rows and keeps its original schema.
++query II
++SELECT table_id, schema_version FROM ducklake_meta.ducklake_schema_versions ORDER BY ALL
++----
++1	1
++1	2
++
++query II
++SELECT table_id, schema_version FROM ducklake_meta.ducklake_inlined_data_tables ORDER BY ALL
++----
++1	1
++1	2
++
++query T
++SELECT nulls_allowed FROM ducklake_meta.ducklake_column WHERE table_id = 1 AND column_name = 'effective_on' AND end_snapshot IS NULL
++----
++true
++
++# Preserve the native error contract when the constraint is already absent.
++statement error
++ALTER TABLE ducklake.records ALTER effective_on DROP NOT NULL
++----
++no NOT NULL constraint
++
++statement ok
++INSERT INTO ducklake.records VALUES (3, NULL, 'historical')
++
++query IT
++SELECT id, filename FROM ducklake.records ORDER BY id
++----
++1	ducklake_inlined_data_1_1
++2	ducklake_inlined_data_1_1
++3	ducklake_inlined_data_1_2
++
++# Successful DDL and INSERT alone did not detect upstream issue #1383.
++statement ok
++CALL ducklake_flush_inlined_data('ducklake')
++
++query II
++SELECT table_id, schema_version FROM ducklake_meta.ducklake_inlined_data_tables ORDER BY ALL
++----
++1	2
++
++query ITT
++SELECT id, effective_on::VARCHAR, payload FROM ducklake.records ORDER BY id
++----
++1	2000-01-01	original one
++2	2001-02-03	original two
++3	NULL	historical
++
++statement ok
++DETACH ducklake
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/inlining_nullability_drop', METADATA_CATALOG 'ducklake_meta', DATA_INLINING_ROW_LIMIT 100)
++
++query ITT
++SELECT id, effective_on::VARCHAR, payload FROM ducklake.records ORDER BY id
++----
++1	2000-01-01	original one
++2	2001-02-03	original two
++3	NULL	historical
++
++statement error
++ALTER TABLE ducklake.records ALTER effective_on SET NOT NULL
++----
++has NULL values
+diff --git a/test/sql/data_inlining/data_inlining_nullability_default.test b/test/sql/data_inlining/data_inlining_nullability_default.test
+new file mode 100644
+index 0000000..b8b8d1b
+--- /dev/null
++++ b/test/sql/data_inlining/data_inlining_nullability_default.test
+@@ -0,0 +1,121 @@
++# name: test/sql/data_inlining/data_inlining_nullability_default.test
++# description: NOT NULL and default changes keep the inline schema and column metadata aligned
++# group: [data_inlining]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/inlining_nullability_default.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/inlining_nullability_default', METADATA_CATALOG 'ducklake_meta', DATA_INLINING_ROW_LIMIT 100)
++
++statement ok
++CREATE TABLE ducklake.records(id INTEGER, value INTEGER, payload VARCHAR)
++
++statement ok
++INSERT INTO ducklake.records VALUES (1, 5, 'original')
++
++# SET NOT NULL and SET DEFAULT share the column-change commit path with DROP.
++statement ok
++ALTER TABLE ducklake.records ALTER value SET NOT NULL
++
++query I
++SELECT max(schema_version) FROM ducklake_meta.ducklake_inlined_data_tables WHERE table_id = 1
++----
++2
++
++statement error
++INSERT INTO ducklake.records VALUES (2, NULL, 'must fail')
++----
++NOT NULL constraint
++
++statement ok
++ALTER TABLE ducklake.records ALTER value SET DEFAULT 10
++
++query I
++SELECT max(schema_version) FROM ducklake_meta.ducklake_inlined_data_tables WHERE table_id = 1
++----
++3
++
++statement ok
++INSERT INTO ducklake.records(id, payload) VALUES (2, 'first default')
++
++statement ok
++BEGIN
++
++statement ok
++ALTER TABLE ducklake.records ALTER value DROP NOT NULL
++
++statement ok
++ALTER TABLE ducklake.records ALTER value SET DEFAULT 20
++
++statement ok
++ALTER TABLE ducklake.records ALTER value SET DEFAULT 30
++
++statement ok
++COMMIT
++
++# The last field change is SET DEFAULT, so a DROP-only rotation check after
++# field deduplication would miss it. No ADD or RENAME should mask this case.
++query I
++SELECT max(schema_version) FROM ducklake_meta.ducklake_schema_versions WHERE table_id = 1
++----
++4
++
++query I
++SELECT max(schema_version) FROM ducklake_meta.ducklake_inlined_data_tables WHERE table_id = 1
++----
++4
++
++query T
++SELECT nulls_allowed FROM ducklake_meta.ducklake_column WHERE table_id = 1 AND column_name = 'value' AND end_snapshot IS NULL
++----
++true
++
++statement ok
++INSERT INTO ducklake.records VALUES (3, NULL, 'explicit NULL')
++
++statement ok
++INSERT INTO ducklake.records(id, payload) VALUES (4, 'final default')
++
++query IT
++SELECT id, filename FROM ducklake.records ORDER BY id
++----
++1	ducklake_inlined_data_1_1
++2	ducklake_inlined_data_1_3
++3	ducklake_inlined_data_1_4
++4	ducklake_inlined_data_1_4
++
++statement ok
++CALL ducklake_flush_inlined_data('ducklake')
++
++query IIT
++SELECT id, value, payload FROM ducklake.records ORDER BY id
++----
++1	5	original
++2	10	first default
++3	NULL	explicit NULL
++4	30	final default
++
++statement ok
++DETACH ducklake
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/inlining_nullability_default', METADATA_CATALOG 'ducklake_meta', DATA_INLINING_ROW_LIMIT 100)
++
++query IIT
++SELECT id, value, payload FROM ducklake.records ORDER BY id
++----
++1	5	original
++2	10	first default
++3	NULL	explicit NULL
++4	30	final default
++
++query I
++SELECT schema_version FROM ducklake_meta.ducklake_inlined_data_tables WHERE table_id = 1
++----
++4
+diff --git a/test/sql/data_inlining/data_inlining_nullability_transaction.test b/test/sql/data_inlining/data_inlining_nullability_transaction.test
+new file mode 100644
+index 0000000..669d44e
+--- /dev/null
++++ b/test/sql/data_inlining/data_inlining_nullability_transaction.test
+@@ -0,0 +1,122 @@
++# name: test/sql/data_inlining/data_inlining_nullability_transaction.test
++# description: Tightening rolls back and supported same-column changes use the final inline schema
++# group: [data_inlining]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/inlining_nullability_transaction.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/inlining_nullability_transaction', METADATA_CATALOG 'ducklake_meta', DATA_INLINING_ROW_LIMIT 100)
++
++statement ok
++CREATE TABLE ducklake.records(id INTEGER, value INTEGER NOT NULL, payload VARCHAR)
++
++statement ok
++INSERT INTO ducklake.records VALUES (1, 10, 'original')
++
++statement ok
++BEGIN
++
++statement ok
++ALTER TABLE ducklake.records ALTER value DROP NOT NULL
++
++statement error
++ALTER TABLE ducklake.records ALTER value SET NOT NULL
++----
++transaction-local changes or no stats
++
++statement ok
++ROLLBACK
++
++# Tightening after a transaction-local ALTER is not supported. Rolling back
++# must restore both the catalog definition and the enforced constraint.
++query T
++SELECT nulls_allowed FROM ducklake_meta.ducklake_column WHERE table_id = 1 AND column_name = 'value' AND end_snapshot IS NULL
++----
++false
++
++statement error
++INSERT INTO ducklake.records VALUES (2, NULL, 'must fail after rollback')
++----
++NOT NULL constraint
++
++statement ok
++BEGIN
++
++statement ok
++ALTER TABLE ducklake.records ALTER value DROP NOT NULL
++
++statement ok
++ALTER TABLE ducklake.records ALTER value SET DEFAULT 20
++
++statement ok
++ALTER TABLE ducklake.records ALTER value SET DEFAULT 30
++
++# Include a transaction-local write, not only a sequence of catalog changes.
++statement ok
++INSERT INTO ducklake.records VALUES (2, NULL, 'transaction local')
++
++statement ok
++COMMIT
++
++# Deduplicating changes to the same field must still rotate the inline table
++# once, even when its last change is SET DEFAULT rather than DROP NOT NULL.
++query II
++SELECT table_id, schema_version FROM ducklake_meta.ducklake_schema_versions ORDER BY ALL
++----
++1	1
++1	2
++
++query II
++SELECT table_id, schema_version FROM ducklake_meta.ducklake_inlined_data_tables ORDER BY ALL
++----
++1	1
++1	2
++
++query T
++SELECT nulls_allowed FROM ducklake_meta.ducklake_column WHERE table_id = 1 AND column_name = 'value' AND end_snapshot IS NULL
++----
++true
++
++statement ok
++INSERT INTO ducklake.records(id, payload) VALUES (3, 'final default')
++
++query IT
++SELECT id, filename FROM ducklake.records ORDER BY id
++----
++1	ducklake_inlined_data_1_1
++2	ducklake_inlined_data_1_2
++3	ducklake_inlined_data_1_2
++
++statement ok
++CALL ducklake_flush_inlined_data('ducklake')
++
++query IIT
++SELECT id, value, payload FROM ducklake.records ORDER BY id
++----
++1	10	original
++2	NULL	transaction local
++3	30	final default
++
++statement ok
++DETACH ducklake
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/inlining_nullability_transaction', METADATA_CATALOG 'ducklake_meta', DATA_INLINING_ROW_LIMIT 100)
++
++query IIT
++SELECT id, value, payload FROM ducklake.records ORDER BY id
++----
++1	10	original
++2	NULL	transaction local
++3	30	final default
++
++query II
++SELECT table_id, schema_version FROM ducklake_meta.ducklake_inlined_data_tables ORDER BY ALL
++----
++1	2

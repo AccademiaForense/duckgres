@@ -39,6 +39,8 @@
 #                  discards queued messages until Sync (#718). A same pgwire
 #                  session remains usable immediately after CancelRequest.
 #   activation   : DuckLake catalogs attach, read/write, and EXPLAIN/ANALYZE on cnpg.
+#                  DROP NOT NULL changes catalog metadata and permits NULL writes,
+#                  including multi-ALTER migrations, without losing existing rows.
 #   metadata pg  : the native TLS/SNI proxy is fail-closed until the warehouse
 #                  is explicitly opted in; only exact dbname=metadata passes,
 #                  and a real DuckLake metadata-table query reaches the hidden
@@ -2725,6 +2727,66 @@ durability_across_restart() { # org password
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
+# A command-complete response is not enough: DROP NOT NULL used to be silently
+# stripped on DuckLake. Verify metadata, a real NULL write and its S3 flush,
+# then check conditional migration retries and native errors. Force inlining only for
+# these disposable tables to catch duckdb/ducklake#1383 deterministically.
+# Runs on CNPG only: this harness provisions no external-metadata tenant and
+# holds no credential to create one (see README's deliberately-not-covered list).
+drop_not_null_migration() { # org password
+  log "DROP NOT NULL migration on $1"
+  for nn_mode in single multi; do
+    nn_table="e2e_drop_not_null_${nn_mode}"
+    nn_target="ducklake.main.$nn_table"
+    pg "$1" "$2" ducklake "CREATE TABLE $nn_target (id INT, effective_on DATE NOT NULL, payload VARCHAR)" >/dev/null
+    pg "$1" "$2" ducklake "CALL ducklake_set_option('ducklake', 'data_inlining_row_limit', 100, schema => 'main', table_name => '$nn_table')" >/dev/null
+    pg "$1" "$2" ducklake "INSERT INTO $nn_target VALUES (1, DATE '2000-01-01', 'before migration')" >/dev/null
+    # The compatibility view exposes physical main as PostgreSQL public.
+    nn_meta="SELECT is_nullable FROM information_schema.columns WHERE table_catalog='ducklake' AND table_schema='public' AND table_name='$nn_table' AND column_name='effective_on'"
+    nn_nullable="$(pg "$1" "$2" ducklake "$nn_meta")"
+    [ "$nn_nullable" = "NO" ] || fail "DROP NOT NULL: fixture is_nullable=$nn_nullable, want NO"
+    if nn_err="$(pg_try "$1" "$2" ducklake "INSERT INTO $nn_target VALUES (2, NULL, 'must fail')")"; then
+      fail "DROP NOT NULL: fixture did not enforce its constraint"
+    fi
+    case "$nn_err" in *"NOT NULL"*) : ;; *) fail "DROP NOT NULL: unexpected pre-migration error: $nn_err" ;; esac
+
+    nn_alter="ALTER TABLE $nn_target ALTER COLUMN effective_on DROP NOT NULL"
+    [ "$nn_mode" != multi ] || nn_alter="$nn_alter, ADD COLUMN source_id VARCHAR"
+    # Retry the migration by checking metadata, not by repeating native DDL.
+    nn_applied=0
+    for nn_attempt in 1 2; do
+      nn_nullable="$(pg "$1" "$2" ducklake "$nn_meta")"
+      case "$nn_nullable" in
+        NO) pg "$1" "$2" ducklake "$nn_alter" >/dev/null; nn_applied=$((nn_applied + 1)) ;;
+        YES) : ;;
+        *) fail "DROP NOT NULL: invalid migration metadata '$nn_nullable'" ;;
+      esac
+    done
+    [ "$nn_applied" = "1" ] || fail "DROP NOT NULL: conditional migration applied $nn_applied times, want 1"
+    nn_nullable="$(pg "$1" "$2" ducklake "$nn_meta")"
+    [ "$nn_nullable" = "YES" ] || fail "DROP NOT NULL: is_nullable=$nn_nullable after $nn_mode migration, want YES"
+    if nn_err="$(pg_try "$1" "$2" ducklake "ALTER TABLE $nn_target ALTER COLUMN effective_on DROP NOT NULL")"; then
+      fail "DROP NOT NULL: repeated native DROP silently succeeded"
+    fi
+    case "$nn_err" in *"no NOT NULL constraint"*) : ;; *) fail "DROP NOT NULL: repeated native DROP engine error lost: $nn_err" ;; esac
+    pg "$1" "$2" ducklake "INSERT INTO $nn_target (id, effective_on, payload) VALUES (2, NULL, 'after migration')" >/dev/null
+    if [ "$nn_mode" = multi ]; then
+      pg "$1" "$2" ducklake "UPDATE $nn_target SET source_id='new column' WHERE id=2" >/dev/null
+    fi
+    pg "$1" "$2" ducklake "CALL ducklake_flush_inlined_data('ducklake', table_name => '$nn_table', schema_name => 'main')" >/dev/null
+    nn_counts="$(pg "$1" "$2" ducklake "SELECT count(*), count(effective_on) FROM $nn_target")"
+    [ "$nn_counts" = "2|1" ] || fail "DROP NOT NULL: counts=$nn_counts, want 2|1"
+    nn_original="$(pg "$1" "$2" ducklake "SELECT payload, effective_on::VARCHAR FROM $nn_target WHERE id=1")"
+    [ "$nn_original" = "before migration|2000-01-01" ] || fail "DROP NOT NULL: existing row changed"
+    if nn_err="$(pg_try "$1" "$2" ducklake "ALTER TABLE $nn_target ALTER COLUMN absent_column DROP NOT NULL")"; then
+      fail "DROP NOT NULL: missing column silently succeeded"
+    fi
+    case "$nn_err" in *"absent_column"*) : ;; *) fail "DROP NOT NULL: missing-column engine error lost: $nn_err" ;; esac
+    pg "$1" "$2" ducklake "DROP TABLE $nn_target" >/dev/null
+  done
+  log "DROP NOT NULL migration: OK"
+}
+
 # Concurrent multi-row INSERTs must not lose or duplicate rows — exercises the
 # PostHog DuckLake fork's conflict-retry path. Ported from
 # TestK8sDuckLakeConcurrentWriters.
@@ -4239,6 +4301,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
   rw_ducklake            "$CNPG" "$cnpg_pw"
+  drop_not_null_migration "$CNPG" "$cnpg_pw"
   query_log_round_trip   "$CNPG" "$cnpg_pw"   # after rw_ducklake (DuckLake attached, query-log surface ensured)
   query_log_access_metadata "$CNPG" "$cnpg_pw"
   binary_copy_round_trip "$CNPG" "$cnpg_pw"
