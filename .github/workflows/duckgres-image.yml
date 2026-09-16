@@ -3,7 +3,7 @@ name: duckgres-image
 on:
   push:
     branches:
-      - fix/checkpointer-unsigned-extensions
+      - main
   workflow_dispatch:
 
 permissions:
