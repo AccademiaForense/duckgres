@@ -127,7 +127,7 @@ func New(cfg Config) *Transpiler {
 	t.transforms = append(t.transforms, taggedTransform{FlagOperators, transform.NewOperatorTransform()})
 
 	// 10. SET/SHOW command handling
-	t.transforms = append(t.transforms, taggedTransform{FlagSetShow, transform.NewSetShowTransform()})
+	t.transforms = append(t.transforms, taggedTransform{FlagSetShow, transform.NewSetShowTransform(catalogPolicy.MapPublicToMain)})
 
 	// 11. _pg_expandarray handling (PostgreSQL array expansion function used by JDBC)
 	t.transforms = append(t.transforms, taggedTransform{FlagExpandArray, transform.NewExpandArrayTransform()})
@@ -411,8 +411,10 @@ func Classify(sql string, cfg Config) Classification {
 		flags |= FlagInfoSchema
 	}
 
-	// public.table references (but not catalog.public.table which is 3-part)
-	if strings.Contains(upper, "PUBLIC.") {
+	// public.table references (but not catalog.public.table which is 3-part).
+	// Match the quoted spelling too: `"public"."table"` uppercases to
+	// `"PUBLIC"."TABLE"`, which does not contain the bare `PUBLIC.` substring.
+	if strings.Contains(upper, "PUBLIC.") || strings.Contains(upper, `"PUBLIC".`) {
 		flags |= FlagPublicSchema
 	}
 
