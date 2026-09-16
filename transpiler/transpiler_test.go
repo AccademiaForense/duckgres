@@ -543,6 +543,22 @@ func TestTranspile_PublicSchema(t *testing.T) {
 			excludes: "public.new_table",
 		},
 		{
+			name:     "quoted public table ref -> main",
+			input:    `SELECT * FROM "public"."categories"`,
+			contains: "main.",
+			excludes: `"public"`,
+		},
+		{
+			name:     "SET search_path public -> main",
+			input:    "SET search_path TO public",
+			expected: "SET search_path = 'main'",
+		},
+		{
+			name:     "SET search_path mixed public -> main",
+			input:    "SET search_path TO analytics, public",
+			expected: "SET search_path = 'analytics,main'",
+		},
+		{
 			name:     "3-part catalog.public.table unchanged",
 			input:    "SELECT * FROM postgres.public.users",
 			expected: "SELECT * FROM postgres.public.users",

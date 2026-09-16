@@ -28,7 +28,7 @@ func NewDuckLakeCheckpointer(cfg Config) (*DuckLakeCheckpointer, error) {
 		return nil, nil
 	}
 
-	db, err := sql.Open("duckdb", ":memory:")
+	db, err := sql.Open("duckdb", ":memory:?allow_unsigned_extensions=true")
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint: open duckdb: %w", err)
 	}

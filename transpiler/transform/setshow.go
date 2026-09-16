@@ -169,11 +169,17 @@ type SetShowTransform struct {
 
 	// VariableParams are parameters that need SET VARIABLE syntax in DuckDB
 	VariableParams map[string]bool
+
+	// MapPublicToMain rewrites "public" entries in SET search_path to the
+	// physical default schema "main", mirroring the reference rewrite for
+	// table references. False for backends whose physical schema is "public".
+	MapPublicToMain bool
 }
 
 // NewSetShowTransform creates a new SetShowTransform with default ignored parameters.
-func NewSetShowTransform() *SetShowTransform {
+func NewSetShowTransform(mapPublicToMain bool) *SetShowTransform {
 	return &SetShowTransform{
+		MapPublicToMain: mapPublicToMain,
 		IgnoredParams: map[string]bool{
 			// SSL/Connection settings
 			"ssl_renegotiation_limit": true,
@@ -473,7 +479,7 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 				}
 
 				if paramName == "search_path" {
-					if sql, ok := normalizeSearchPathSet(n.VariableSetStmt); ok {
+					if sql, ok := normalizeSearchPathSet(n.VariableSetStmt, t.MapPublicToMain); ok {
 						result.SQLOverride = sql
 						return true, nil
 					}
@@ -600,7 +606,7 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 	return changed, nil
 }
 
-func normalizeSearchPathSet(stmt *pg_query.VariableSetStmt) (string, bool) {
+func normalizeSearchPathSet(stmt *pg_query.VariableSetStmt, mapPublicToMain bool) (string, bool) {
 	if stmt == nil || stmt.Kind != pg_query.VariableSetKind_VAR_SET_VALUE || len(stmt.Args) == 0 {
 		return "", false
 	}
@@ -610,6 +616,9 @@ func normalizeSearchPathSet(stmt *pg_query.VariableSetStmt) (string, bool) {
 		part, ok := searchPathValue(arg)
 		if !ok {
 			return "", false
+		}
+		if mapPublicToMain && isPublicSchemaName(part) {
+			part = "main"
 		}
 		parts = append(parts, part)
 	}
@@ -622,6 +631,13 @@ func normalizeSearchPathSet(stmt *pg_query.VariableSetStmt) (string, bool) {
 	value := strings.Join(parts, ",")
 	value = strings.ReplaceAll(value, "'", "''")
 	return prefix + "'" + value + "'", true
+}
+
+// isPublicSchemaName reports whether a search_path entry names PostgreSQL's
+// default "public" schema, tolerating surrounding whitespace and quoted
+// spellings such as "public".
+func isPublicSchemaName(part string) bool {
+	return strings.EqualFold(strings.Trim(strings.TrimSpace(part), `"`), "public")
 }
 
 func searchPathValue(node *pg_query.Node) (string, bool) {
