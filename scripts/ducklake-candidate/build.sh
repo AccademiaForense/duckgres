@@ -13,8 +13,9 @@ sha256_file() {
 
 check_only=false
 if [ "${1:-}" = --check ]; then check_only=true; shift; fi
-[ "$#" -ge 1 ] && [ "$#" -le 2 ] || fail \
-    'Usage: sh scripts/ducklake-candidate/build.sh [--check] BASE_IMAGE [duckgres:ducklake-inline-local]'
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    fail 'Usage: sh scripts/ducklake-candidate/build.sh [--check] BASE_IMAGE [duckgres:ducklake-inline-local]'
+fi
 base_image=$1
 candidate_image=${2:-duckgres:ducklake-inline-local}
 case "$base_image" in

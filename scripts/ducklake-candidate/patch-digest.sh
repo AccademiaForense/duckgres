@@ -10,9 +10,9 @@ while IFS= read -r patch_file || [ -n "$patch_file" ]; do
         ''|*[!a-zA-Z0-9._-]*) printf 'ERROR: invalid patch filename\n' >&2; exit 1 ;;
     esac
     patch_path="$script_dir/patches/$patch_file"
-    [ -s "$patch_path" ] && [ -r "$patch_path" ] || {
+    if [ ! -s "$patch_path" ] || [ ! -r "$patch_path" ]; then
         printf 'ERROR: missing or empty patch: %s\n' "$patch_file" >&2; exit 1;
-    }
+    fi
     if command -v sha256sum >/dev/null 2>&1; then
         patch_hash=$(sha256sum "$patch_path")
     else

@@ -101,3 +101,30 @@ docker() { printf '%s\\n' "$TEST_BINDING"; }
 discover_port
 ''')
                 self.assertNotEqual(result.returncode, 0)
+
+    def test_wire_port_range_boundaries_preserve_safe_dsn(self):
+        for port, accepted in (("1", True), ("65535", True), ("0", False),
+                               ("5432", False), ("65536", False),
+                               ("99999999999999999999999999", False)):
+            with self.subTest(port=port):
+                self.env["TEST_BINDING"] = "127.0.0.1:" + port
+                result = self.run_shell('''
+. "$TEST_SOURCE/sql.sh"
+duckgres_id=fixture
+assert_owned_container() { :; }
+docker() {
+    [ "$*" = "port fixture 5432/tcp" ] || return 90
+    printf '%s\\n' "$TEST_BINDING"
+}
+discover_port
+printf '%s\\n%s\\n' "$wire_port" "$wire_dsn"
+''')
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, port + "\n" +
+                                     f"host=127.0.0.1 port={port} user=ducklake "
+                                     "dbname=ducklake sslmode=require connect_timeout=5\n")
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unsafe published wire port", result.stderr)
+                    self.assertEqual(result.stdout, "")

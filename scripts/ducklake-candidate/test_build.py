@@ -68,6 +68,15 @@ class CandidatePreflightTests(unittest.TestCase):
     def test_requires_explicit_base(self):
         self.assert_rejected([], "Usage:")
 
+    def test_rejects_too_many_arguments_before_docker(self):
+        for prefix in ([], ["--check"]):
+            with self.subTest(prefix=prefix):
+                self.assert_rejected(
+                    prefix + ["duckgres:base", "duckgres:ducklake-test", "extra"],
+                    "Usage:",
+                )
+                self.assertFalse((self.root / "docker.log").exists())
+
     def test_rejects_implicit_and_explicit_latest(self):
         for base in ("duckgres", "duckgres:latest"):
             with self.subTest(base=base):
@@ -102,6 +111,11 @@ class CandidatePreflightTests(unittest.TestCase):
     def test_requires_patch(self):
         (self.scripts / "patches" / "0002-inline-schema-nullability.patch").unlink()
         self.assert_rejected(["--check", "duckgres:base"], "missing or empty patch")
+
+    def test_rejects_empty_patch_before_docker(self):
+        (self.scripts / "patches" / "0002-inline-schema-nullability.patch").write_text("")
+        self.assert_rejected(["--check", "duckgres:base"], "missing or empty patch")
+        self.assertFalse((self.root / "docker.log").exists())
 
     def test_rejects_binding_drift(self):
         (self.root / "go.mod").write_text("module example.invalid/other\n")
@@ -150,10 +164,12 @@ class CandidatePreflightTests(unittest.TestCase):
         self.assert_rejected(["--check", "duckgres:base"], "invalid patch filename")
 
     def test_check_only_is_read_only(self):
-        result = self.run_script("--check", "duckgres:base")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Preflight passed", result.stdout)
-        self.assertFalse((self.root / "artifacts").exists())
+        for args in (("duckgres:base",), ("duckgres:base", "duckgres:ducklake-test")):
+            with self.subTest(args=args):
+                result = self.run_script("--check", *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Preflight passed", result.stdout)
+                self.assertFalse((self.root / "artifacts").exists())
         calls = (self.root / "docker.log").read_text().splitlines()
         self.assertTrue(calls)
         self.assertTrue(all(c.startswith(("context inspect", "image inspect")) for c in calls))

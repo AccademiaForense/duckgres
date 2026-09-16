@@ -101,6 +101,19 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("archive directory must not exist", result.stderr)
         self.assertNotIn("image save", self.calls())
 
+    def test_export_refuses_dangling_archive_symlink_before_docker(self):
+        target = self.root / "missing-archive-target"
+        self.archive.symlink_to(target, target_is_directory=True)
+        self.assertTrue(self.archive.is_symlink())
+        self.assertFalse(self.archive.exists())
+        result = self.run_script("export.sh", IMAGE_ID, self.evidence, self.archive)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("archive directory must not exist", result.stderr)
+        self.assertEqual(self.calls(), "")
+        self.assertTrue(self.archive.is_symlink())
+        self.assertEqual(os.readlink(self.archive), str(target))
+        self.assertFalse(target.exists())
+
     def test_archive_roundtrip_requires_job_output_hash_and_image_id(self):
         digest = self.export()
         result = self.run_script("restore.sh", self.archive, digest, IMAGE_ID)

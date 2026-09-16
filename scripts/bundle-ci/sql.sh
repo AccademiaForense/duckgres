@@ -6,7 +6,9 @@ discover_port() {
     case "$published" in 127.0.0.1:*) ;; *) fail 'wire port is not exclusively loopback' ;; esac
     wire_port=${published#127.0.0.1:}
     case "$wire_port" in ''|*[!0-9]*) fail 'invalid published wire port' ;; esac
-    [ "$wire_port" -gt 0 ] && [ "$wire_port" -le 65535 ] && [ "$wire_port" != 5432 ] || fail 'unsafe published wire port'
+    if ! { [ "$wire_port" -gt 0 ] && [ "$wire_port" -le 65535 ] && [ "$wire_port" != 5432 ]; }; then
+        fail 'unsafe published wire port'
+    fi
     wire_dsn="host=127.0.0.1 port=$wire_port user=ducklake dbname=ducklake sslmode=require connect_timeout=5"
 }
 bundle_sql() {

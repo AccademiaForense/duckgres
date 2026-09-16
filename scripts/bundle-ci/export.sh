@@ -8,7 +8,9 @@ image_id=$1
 evidence=$2
 archive=$3
 case "$archive" in /*) ;; *) fail 'archive directory must be absolute' ;; esac
-[ ! -e "$archive" ] && [ ! -L "$archive" ] || fail 'archive directory must not exist'
+if [ -e "$archive" ] || [ -L "$archive" ]; then
+    fail 'archive directory must not exist'
+fi
 local_docker
 check_image "$image_id"
 check_gate "$evidence/qualification.env" "$image_id"
