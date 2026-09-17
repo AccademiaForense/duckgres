@@ -35,10 +35,13 @@ class ReleaseTests(unittest.TestCase):
             ' "image load") : ;;\n'
             ' "buildx imagetools") printf \'{"digest":"sha256:%064d"}\\n\' 3 ;;\n'
             ' "manifest inspect")\n'
-            '  case "${MOCK_REMOTE:-absent}" in\n'
+            '  remote="${MOCK_REMOTE:-absent}"\n'
+            '  case "$3" in *:sha-???????) remote="${MOCK_SHORT_REMOTE:-$remote}" ;; esac\n'
+            '  case "$remote" in\n'
             '   absent) echo "no such manifest: $3" >&2; exit 1 ;;\n'
             '   denied) echo "unauthorized: access denied" >&2; exit 1 ;;\n'
-            '   *) printf \'{"schemaVersion":2,"config":{"digest":"%s"}}\\n\' "$MOCK_REMOTE" ;;\n'
+            '   error) printf "%s\\n" "$MOCK_MANIFEST_ERROR" >&2; exit 1 ;;\n'
+            '   *) printf \'{"schemaVersion":2,"config":{"digest":"%s"}}\\n\' "$remote" ;;\n'
             '  esac ;;\n'
             ' "tag "*|"push "*) : ;;\n'
             ' *) echo "unexpected Docker call" >&2; exit 90 ;;\n'
@@ -156,12 +159,67 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("refusing to replace immutable commit tag", result.stderr)
         self.assertNotIn("push ", self.calls())
 
+    def test_publish_recognizes_manifest_unknown_messages(self):
+        self.env["MOCK_REMOTE"] = "error"
+        for message in ("manifest unknown", "manifest unknown: manifest unknown"):
+            with self.subTest(message=message):
+                self.env["MOCK_MANIFEST_ERROR"] = message
+                previous_calls = len(self.calls())
+                result = self.run_script("publish.sh", IMAGE_ID, "Example/duckgres", COMMIT)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = self.calls()[previous_calls:]
+                for tag in ("sha-" + COMMIT, "sha-" + COMMIT[:7], "latest"):
+                    self.assertIn(f"tag {IMAGE_ID} ghcr.io/example/duckgres:{tag}", calls)
+                    self.assertIn(f"push ghcr.io/example/duckgres:{tag}", calls)
+                self.assertNotIn("build ", calls)
+
     def test_publish_refuses_registry_errors(self):
-        self.env["MOCK_REMOTE"] = "denied"
-        result = self.run_script("publish.sh", IMAGE_ID, "Example/duckgres", COMMIT)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("cannot establish registry state", result.stderr)
-        self.assertNotIn("push ", self.calls())
+        self.env["MOCK_REMOTE"] = "error"
+        for message in (
+            "unauthorized: access denied",
+            "denied: permission_denied: read_package",
+            "failed to fetch anonymous token: 401 Unauthorized",
+            "403 Forbidden",
+            "dial tcp: lookup ghcr.io: no such host",
+            "net/http: TLS handshake timeout",
+            "x509: certificate signed by unknown authority",
+            "unexpected status: 429 Too Many Requests",
+            "unexpected status: 503 Service Unavailable",
+            "",
+            "no such manifest: ghcr.io/example/duckgres:another-tag",
+            "unexpected proxy error: manifest unknown: manifest unknown",
+            "unauthorized: access denied\nmanifest unknown",
+            "manifest unknown: manifest unknown\n503 Service Unavailable",
+            f"no such manifest: ghcr.io/example/duckgres:sha-{COMMIT}\nunauthorized",
+        ):
+            with self.subTest(message=message):
+                self.env["MOCK_MANIFEST_ERROR"] = message
+                previous_calls = len(self.calls())
+                result = self.run_script("publish.sh", IMAGE_ID, "Example/duckgres", COMMIT)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("cannot establish registry state", result.stderr)
+                calls = self.calls()[previous_calls:]
+                self.assertNotIn("tag ", calls)
+                self.assertNotIn("push ", calls)
+
+    def test_publish_checks_short_tag_before_any_write(self):
+        self.env["MOCK_REMOTE"] = "absent"
+        self.env["MOCK_MANIFEST_ERROR"] = "unauthorized: access denied"
+        for remote, error in (
+            ("error", "cannot establish registry state"),
+            ("sha256:" + "2" * 64, "refusing to replace immutable commit tag"),
+        ):
+            with self.subTest(remote=remote):
+                self.env["MOCK_SHORT_REMOTE"] = remote
+                previous_calls = len(self.calls())
+                result = self.run_script("publish.sh", IMAGE_ID, "Example/duckgres", COMMIT)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+                calls = self.calls()[previous_calls:]
+                for tag in ("sha-" + COMMIT, "sha-" + COMMIT[:7]):
+                    self.assertIn(f"manifest inspect ghcr.io/example/duckgres:{tag}", calls)
+                self.assertNotIn("tag ", calls)
+                self.assertNotIn("push ", calls)
 
     def test_publish_old_commit_does_not_move_latest_backwards(self):
         self.env["MOCK_MAIN"] = "b" * 40
