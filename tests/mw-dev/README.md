@@ -209,6 +209,17 @@ client-go:
   backpressure was observed **and** handles it (queries retry through it).
 - **activation** — DuckLake catalogs attach, read/write, and run
   `EXPLAIN`/`EXPLAIN ANALYZE` on CNPG-backed tenants.
+- **DROP NOT NULL migrations** — both single and multi-command `ALTER TABLE`
+  change `information_schema.columns.is_nullable` from `NO` to `YES` and permit
+  real NULL writes and an inlined-data flush to S3. Inlining is explicitly
+  enabled only on the disposable test table. The flush is a release gate for
+  [DuckLake #1383](https://github.com/duckdb/ducklake/issues/1383), reproduced
+  locally with the bundled `v1.0-posthog.7`; do not remove it to make that build
+  pass. Existing rows survive, and retrying a metadata-conditional migration
+  skips DDL once the column is nullable. An unconditional repeated DROP and a
+  missing-column ALTER preserve their native engine errors. This assertion
+  runs in the DuckDB lane on a CNPG-backed catalog;
+  the harness currently provisions no external-metadata test tenant.
 - **native metadata Postgres proxy** — the Job reaches the actual proxy branch
   over the control-plane ClusterIP while libpq sends a dedicated, non-resolving
   TLS SNI name (`<org>.md.ci.duckgres.local`). It proves a ready CNPG org is
@@ -336,6 +347,13 @@ normal `go test ./...` lane.
   `TestOrgMetadataProxyEnabledFailsClosed`; the live proxy check still proves
   the independent access boundary by leaving a second ready tenant on the same
   CNPG shard opted out.
+
+- **DROP NOT NULL on an EXTERNAL metadata store** — `drop_not_null_migration`
+  runs only on the CNPG-backed DuckLake tenant. The suite's existing provisioning
+  supports no external test tenant or external-store credential. The transpiler
+  change does not branch on metadata backend, but CNPG success must not be
+  reported as external-backend qualification. Run the same assertion against an
+  authorized isolated external-metadata tenant when such a lane is available.
 
 - **The query log on an EXTERNAL (RDS) metadata store** — the suite provisions
   only cnpg-shard orgs, so `query_log_round_trip` runs on cnpg alone. The

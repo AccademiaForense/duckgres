@@ -16,7 +16,7 @@ build:
 build-release version="dev":
     go build -ldflags "-X main.version={{version}} -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
 
-# Build Docker image
+# Build the coherent all-in-one Docker image (currently linux/amd64 only)
 [group('build')]
 docker tag="duckgres:dev":
     docker build -t {{tag}} .
@@ -45,6 +45,30 @@ run-control-plane: build
 [group('dev')]
 build-k8s-image tag="duckgres:test":
     docker build --build-arg BUILD_TAGS=kubernetes -t {{tag}} .
+
+# Optional overlay for experiments against an explicitly selected local base.
+[group('dev')]
+build-ducklake-candidate base_image tag="duckgres:ducklake-inline-local":
+    sh scripts/ducklake-candidate/build.sh {{quote(base_image)}} {{quote(tag)}}
+
+# Read-only input checks, with no build, pull, or container creation.
+[group('dev')]
+check-ducklake-candidate base_image tag="duckgres:ducklake-inline-local":
+    sh scripts/ducklake-candidate/build.sh --check {{quote(base_image)}} {{quote(tag)}}
+
+# Qualify an existing local image on disposable PostgreSQL/S3 fixtures, no Compose.
+[group('test')]
+qualify-duckdb-bundle image evidence_dir:
+    sh scripts/bundle-ci/qualify.sh {{quote(image)}} {{quote(evidence_dir)}}
+
+# No containers or registry mutations: validate build, workflow and release guards.
+[group('test')]
+test-bundle-build:
+    go test ./tests/manifests ./scripts/ducklake-candidate/wirecheck
+    python3 -B -m unittest discover -s scripts/ducklake-candidate -p 'test_*.py'
+    python3 -B -m unittest discover -s scripts/bundle-ci -p 'test_*.py'
+    shellcheck -x scripts/ducklake-candidate/*.sh scripts/bundle-ci/*.sh
+    actionlint .github/workflows/duckgres-image.yml
 
 # Build the admin console SPA into controlplane/admin/ui/dist (embedded by the
 # kubernetes build via //go:embed all:ui/dist). dist is a gitignored build

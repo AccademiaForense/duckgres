@@ -1134,6 +1134,67 @@ The following DuckDB features work transparently through the fallback mechanism:
 - `BEGIN/COMMIT/ROLLBACK` (DuckDB transaction support)
 - `COPY` - Bulk data loading and export (see below)
 
+### Dropping NOT NULL on DuckLake
+
+`ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL` executes against the engine,
+including inside a multi-command `ALTER TABLE`; it is not a compatibility
+no-op. Statement errors (for example, an unknown column) are returned to the
+client. This does not fix the existing multi-statement cleanup path, which
+logs rather than propagates a failing wrapper `COMMIT`; do not treat the
+positive multi-ALTER regression as commit-failure coverage.
+`ALTER COLUMN ... SET NOT NULL` retains its existing DuckLake no-op
+behavior; this change does not add support for tightening constraints.
+
+**Release blocker with unpatched DuckLake `v1.0-posthog.7`:** local
+PostgreSQL/S3 qualification accepts the nullable column and NULL inserts, but
+flushing inlined rows fails with the old NOT NULL constraint. This reproduces
+[DuckLake #1383](https://github.com/duckdb/ducklake/issues/1383): the inlined
+table retains its pre-migration schema version. The regressions explicitly
+enable inlining on their disposable table and require a successful flush.
+The transpiler fix alone must not be treated as a qualified migration release;
+use a separately corrected and verified DuckLake build before deployment.
+
+The shared [DuckDB bundle build](scripts/ducklake-candidate/README.md)
+now rebuilds DuckLake, HTTPFS, PostgreSQL scanner and JSON against the exact same
+core. The earlier mixed-core overlay is rejected by its read-only settings gate.
+The coherent candidate passed local PostgreSQL/S3 qualification on 2026-09-16:
+single/multi-ALTER migration, native errors, raw ingestion, idempotent retries,
+concurrent writers, binary COPY and data preservation after a server restart.
+See the [artifact-specific results and limits](scripts/ducklake-candidate/QUALIFICATION.md).
+This is not a qualification of the full multi-tenant cluster. The ordinary
+all-in-one Dockerfile now builds this coherent bundle, and the
+[fork CI release lane](docs/runbooks/coherent-bundle-release.md) tests the actual
+image before publication. Deployment pins and `Dockerfile.worker` are unchanged.
+
+If an older Duckgres reported success but left the column required, upgrade
+Duckgres together with a qualified DuckLake build and check the catalog before
+retrying the migration. Native DuckLake rejects `DROP NOT NULL` when the column
+is already nullable (`no NOT NULL constraint`); the DDL itself is not idempotent.
+A retryable migration issues the ALTER only for `NO`, skips it for `YES`, and
+stops on missing or unexpected metadata. After an ALTER, require `YES` before
+resuming writes. Verify the actual catalog state using the intended
+catalog, schema, table, and column. The PostgreSQL compatibility view exposes
+DuckLake's physical `main` schema as `public`; explicitly named schemas keep
+their names. For a column in `ducklake.main.documents`, query:
+
+```sql
+SELECT is_nullable
+FROM information_schema.columns
+WHERE table_catalog = 'ducklake' AND table_schema = 'public'
+  AND table_name = 'documents' AND column_name = 'effective_on';
+-- Expect exactly one row. NO: apply DROP NOT NULL, then query again for YES.
+-- YES: skip the ALTER. Missing/unexpected result: stop the migration.
+```
+
+Do not replace unknown dates with fabricated values to work around an unchanged
+constraint. Local regression coverage is in `TestDDLDropNotNull`
+(`just test-integration`, with local PostgreSQL and DuckLake dependencies) and
+`TestTranspile_DDL_DropNotNull*` (`just test-unit`). The mw-dev harness also
+asserts the migration through real workers on CNPG metadata; it requires
+authorized upstream cluster access and is not a prerequisite for running the
+local transpiler tests. The harness provisions no external-metadata tenant, so
+that backend still requires separate qualification before claiming coverage.
+
 ### PostgreSQL Compatibility
 - Extended query protocol (prepared statements)
 - Binary and text result formats

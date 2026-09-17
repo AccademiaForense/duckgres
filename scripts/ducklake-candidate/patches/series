@@ -1,0 +1,4 @@
+0001-core-expression-map-compatibility.patch
+0002-inline-schema-nullability.patch
+0003-extended-catalog-statistics.patch
+0004-postgres-unique-ptr-compatibility.patch

@@ -8,6 +8,34 @@ RUN npm ci
 COPY controlplane/admin/ui/ ./
 RUN npm run build
 
+# The all-in-one linux/amd64 image builds every external extension against the
+# same pinned core. Dependency stages match the optional overlay recipe; the
+# source fetch, patch, linkage and native-test gates live in shared scripts.
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS bundle_dependencies
+ARG TARGETARCH
+RUN test "${TARGETARCH}" = amd64 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build git curl ca-certificates zip unzip pkg-config python3 perl autoconf automake libtool \
+    && apt-get clean
+WORKDIR /build
+COPY scripts/ducklake-candidate/pins.env scripts/ducklake-candidate/prepare-deps.sh /build/candidate/
+RUN sh /build/candidate/prepare-deps.sh
+
+FROM bundle_dependencies AS extension_builder
+RUN apt-get update && apt-get install -y --no-install-recommends bison flex && apt-get clean
+COPY scripts/ducklake-candidate/scanner-pins.env scripts/ducklake-candidate/prepare-scanner.sh /build/candidate/
+RUN sh /build/candidate/prepare-scanner.sh
+ARG PATCH_SHA256
+COPY scripts/ducklake-candidate/ /build/candidate/
+COPY go.mod /build/go.mod
+COPY Dockerfile /build/Dockerfile.bundle-build
+RUN --mount=type=cache,id=duckgres-bundle-697fa-gcc12-amd64,target=/build/extension,sharing=locked \
+    sh /build/candidate/check-pins.sh /build/go.mod \
+    && PATCH_SHA256="${PATCH_SHA256:-$(sh /build/candidate/patch-digest.sh)}" \
+       BUNDLE_BUILD_RECIPE=/build/Dockerfile.bundle-build \
+       sh /build/candidate/build-extension.sh
+
 FROM golang:1.25-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
@@ -16,50 +44,9 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Bundled DuckDB extensions. Downloaded BEFORE `COPY . .` so this layer
-# depends only on the extension version args, not on source — a source-only
-# PR keeps the GHA layer-cache hit and skips the 5 downloads entirely. (They
-# previously ran after the source COPY + build, so they re-fetched on every
-# edit.)
-ARG TARGETARCH
-ARG DUCKDB_EXTENSION_VERSION=1.5.5
-ARG HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry
-ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.7
-ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
-# postgres_scanner comes from a PostHog mirror, not from DuckDB's extension
-# repositories. The stable 1.5.5 scanner predates duckdb-postgres 71b85668, which
-# fixes inconsistent snapshots across scan connections, so we need a nightly build.
-# The nightly URL is mutable: upstream rebuilds it and a content pin then stops
-# matching, which hard-failed the build five times between 2026-08-03 and
-# 2026-09-11. The mirror is that nightly artifact captured at a known-good
-# revision behind an immutable URL, so there is nothing left to re-pin.
-ARG POSTGRES_SCANNER_TAG=v1.5.5-a3516c0
-# `: ${VAR:?msg}` asserts every required input is non-empty — catches a
-# CI matrix row that forgets to pass a build-arg and would otherwise
-# silently fall back to the ARG default, producing a cross-version
-# bundle (the failure class the binding-pin check in Dockerfile.worker
-# exists to prevent). The per-file `[ -s ... ]` size check below catches
-# the curl|gunzip failure modes — a curl -fsSL 404 writes nothing, gunzip
-# on empty input exits non-zero, the && chain breaks. (`set -o pipefail`
-# would be cleaner but /bin/sh here is dash, which rejects -o pipefail.)
-RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
-    && : "${HTTPFS_EXTENSION_TAG:?must be set}" \
-    && : "${DUCKLAKE_EXTENSION_TAG:?must be set}" \
-    && : "${DUCKDB_EXTENSION_REPOSITORY:?must be set}" \
-    && : "${POSTGRES_SCANNER_TAG:?must be set}" \
-    && mkdir -p "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}" \
-    && curl -fsSL "https://github.com/PostHog/duckdb-httpfs/releases/download/${HTTPFS_EXTENSION_TAG}/httpfs-linux-${TARGETARCH}.duckdb_extension" \
-      -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/httpfs.duckdb_extension" \
-    && curl -fsSL "https://github.com/PostHog/ducklake/releases/download/${DUCKLAKE_EXTENSION_TAG}/ducklake-linux-${TARGETARCH}.duckdb_extension" \
-      -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/ducklake.duckdb_extension" \
-    && curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension.gz" \
-      | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension" \
-    && curl -fsSL "https://github.com/PostHog/duckdb-postgres/releases/download/${POSTGRES_SCANNER_TAG}/postgres_scanner-linux-${TARGETARCH}.duckdb_extension" \
-      -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension" \
-    && for f in httpfs ducklake json postgres_scanner; do \
-         [ -s "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/$f.duckdb_extension" ] \
-           || { echo "ERROR: $f.duckdb_extension is empty after fetch" >&2; exit 1; }; \
-       done
+# The Go scanner regression and the final runtime use the very same rebuilt
+# extension files. There is no fallback to upstream precompiled binaries.
+COPY --from=extension_builder /out/ /build/duckdb-extensions/v1.5.5/linux_amd64/
 
 COPY . .
 # Overwrite the committed placeholder with the freshly built SPA so the
@@ -90,6 +77,8 @@ RUN apk add --no-cache ca-certificates-bundle libstdc++ postgresql-18-client \
 WORKDIR /app
 COPY --from=builder /build/duckgres .
 COPY --from=builder /build/duckdb-extensions ./extensions
+COPY --from=extension_builder /out/native-tests/ /app/ducklake-candidate/native-tests/
+COPY --from=extension_builder /out/vcpkg-status.txt /app/ducklake-candidate/vcpkg-status.txt
 RUN mkdir -p data certs && chown -R duckgres:duckgres /app
 
 USER duckgres

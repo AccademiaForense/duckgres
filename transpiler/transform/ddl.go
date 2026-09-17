@@ -360,8 +360,9 @@ func (t *DDLTransform) isUnsupportedDefault(expr *pg_query.Node) bool {
 // transformAlterTableStmt handles ALTER TABLE statements for DuckLake compatibility.
 // DuckDB only supports one ALTER command per statement, so multi-command ALTER TABLE
 // statements (e.g., ADD COLUMN x, ADD COLUMN y) are split into individual statements
-// wrapped in a transaction. Unsupported commands (constraints, NOT NULL, DEFAULT) are
-// silently dropped.
+// wrapped in a transaction. Unsupported commands (constraints, SET NOT NULL,
+// DEFAULT) are silently dropped. DROP NOT NULL reaches the engine so migrations
+// actually remove the enforced constraint and engine errors are preserved.
 func (t *DDLTransform) transformAlterTableStmt(stmt *pg_query.AlterTableStmt, result *Result) (bool, error) {
 	// Partition commands into supported and unsupported
 	var supported []*pg_query.Node
@@ -461,9 +462,8 @@ func (t *DDLTransform) isUnsupportedAlterCommand(cmd *pg_query.AlterTableCmd) bo
 		pg_query.AlterTableType_AT_ValidateConstraint,
 		pg_query.AlterTableType_AT_DropConstraint:
 		return true
-	// NOT NULL commands - DuckLake doesn't handle these well
-	case pg_query.AlterTableType_AT_SetNotNull,
-		pg_query.AlterTableType_AT_DropNotNull:
+	// SET NOT NULL remains unsupported; DROP NOT NULL is supported by DuckLake.
+	case pg_query.AlterTableType_AT_SetNotNull:
 		return true
 	// DEFAULT commands - DuckLake has limited support
 	case pg_query.AlterTableType_AT_ColumnDefault:

@@ -101,6 +101,7 @@ Operational guidance: allow the import to complete, then manually deduplicate af
 | Generated columns | 🟡 | transpiler `transform/ddl_test.go` (GENERATED detection) | No differential test |
 | CREATE TABLE AS / TEMP TABLE | ✅ | `ddl_test.go::TestDDLCreateTable` | |
 | ALTER TABLE add/drop/rename column, rename table | ✅ | `ddl_test.go::TestDDLAlterTable` | |
+| ALTER COLUMN DROP NOT NULL | 🟡 | `drop_not_null_test.go::TestDDLDropNotNull`, transpiler `::TestTranspile_DDL_DropNotNull*`, mw-dev `drop_not_null_migration` (CNPG only), `scripts/bundle-ci/qualify.sh` | DDL executes; the all-in-one Dockerfile now includes the inline-schema correction. Unpatched DuckLake `v1.0-posthog.7` fails the flush ([upstream #1383](https://github.com/duckdb/ducklake/issues/1383)). Tests require metadata, NULL writes, flush, row preservation, conditional migration retries and native errors. DROP on an already nullable column errors; retryable migrations must skip it. Multi-statement wrapper COMMIT failures retain existing log-only cleanup behavior. External metadata is not covered by the cluster harness; `SET NOT NULL` remains a no-op. |
 | VIEW (CREATE OR REPLACE, column aliases) | ✅ | `ddl_test.go::TestDDLViews` | |
 | Materialized views | ⛔ | — | `pg_matviews` is an empty stub |
 | INDEX (unique, multi-col, IF [NOT] EXISTS) | 🟡 | `ddl_test.go::TestDDLIndexes` | Accepted, but a no-op in DuckDB/DuckLake mode — not semantically asserted |
@@ -109,6 +110,17 @@ Operational guidance: allow the import to complete, then manually deduplicate af
 | TYPE / ENUM / DOMAIN / composite | ❌ | — | Unmapped DuckDB ENUM/STRUCT/etc. fall back to OidText |
 | COMMENT ON table/column | ✅ | `ddl_test.go::TestDDLComment` | |
 | Partitioning / inheritance | ⛔ | — | `pg_partitioned_table`, `pg_inherits` are empty stubs |
+
+The coherent [local DuckLake candidate](../scripts/ducklake-candidate/README.md)
+passes the native regressions and the local PostgreSQL/S3 runtime checks,
+including single/multi-ALTER, conditional retries, native errors, binary COPY
+and raw-data preservation after restart. The earlier mixed-core HTTPFS overlay
+failed before the first INSERT and remains unsuitable. See the
+[artifact-specific qualification](../scripts/ducklake-candidate/QUALIFICATION.md)
+for scope and limits. The [fork CI lane](runbooks/coherent-bundle-release.md) now
+qualifies the ordinary all-in-one image before publication. This does not change
+deployment pins or qualify the separate worker image; the full CNPG/multi-tenant
+lane was not run.
 
 ---
 
