@@ -96,6 +96,13 @@ stage definitions are checked for drift by a regression.
 - A compile, native-test, wire-gate, flush, restart, cleanup, hash or archive error
   blocks publication. Keep the evidence; do not bypass the failing assertion or
   replace it with a production write experiment.
+- Missing-tag detection accepts only a complete `no such manifest: <requested ref>`,
+  `manifest unknown`, or `manifest unknown: manifest unknown` diagnostic. Empty,
+  unrecognized or mixed diagnostics still block publication, including authentication,
+  network and server failures. If this guard fails, inspect the exact response;
+  do not treat every failed registry lookup as permission to push. A publisher bug
+  requires a reviewed correction and a run of that corrected revision; rerunning
+  an older workflow revision does not pick up fixes from a later commit.
 - If interrupted, inspect the runner's recorded resource IDs and labels before
   cleanup. Do not use global container/image/volume prune commands. A hard-killed
   local runner can leave its own disposable resources until explicitly cleaned.

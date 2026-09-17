@@ -28,14 +28,18 @@ tag_state() {
         [ "$remote_id" = "$image_id" ] || fail "refusing to replace immutable commit tag $1"
         printf 'exists\n'
     else
-        # A registry/network/auth failure is not proof that a tag is absent.
-        if grep -Fx "no such manifest: $1" "$publish_tmp/manifest.err" >/dev/null ||
-            grep -F 'manifest unknown: manifest unknown' "$publish_tmp/manifest.err" >/dev/null; then
-            printf 'missing\n'
-        else
-            cat "$publish_tmp/manifest.err" >&2
-            fail "cannot establish registry state for $1"
-        fi
+        # Match the entire diagnostic: GHCR can return bare "manifest unknown".
+        # Substrings or mixed registry/network/auth errors do not prove absence.
+        manifest_error=$(cat "$publish_tmp/manifest.err")
+        case "$manifest_error" in
+            "no such manifest: $1"|"manifest unknown"|"manifest unknown: manifest unknown")
+                printf 'missing\n'
+                ;;
+            *)
+                cat "$publish_tmp/manifest.err" >&2
+                fail "cannot establish registry state for $1"
+                ;;
+        esac
     fi
 }
 
